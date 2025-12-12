@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>语音对话测试</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+            text-align: center;
+        }
+        .status.connected {
+            background: #4CAF50;
+            color: white;
+        }
+        .status.disconnected {
+            background: #f44336;
+            color: white;
+        }
+        .text-area {
+            margin: 15px 0;
+            padding: 15px;
+            background: #f9f9f9;
+            border-radius: 5px;
+            min-height: 60px;
+        }
+        .text-area label {
+            font-weight: bold;
+            display: block;
+            margin-bottom: 5px;
+            color: #666;
+        }
+        .text-area .content {
+            color: #333;
+            line-height: 1.6;
+        }
+        .controls {
+            text-align: center;
+            margin: 20px 0;
+        }
+        button {
+            padding: 15px 40px;
+            font-size: 16px;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            margin: 0 10px;
+            transition: all 0.3s;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .btn-start {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .btn-start:hover:not(:disabled) {
+            transform: scale(1.05);
+        }
+        .btn-stop {
+            background: #f44336;
+            color: white;
+        }
+        .btn-stop:hover:not(:disabled) {
+            transform: scale(1.05);
+        }
+        .logs {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f0f0f0;
+            border-radius: 5px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 12px;
+            font-family: monospace;
+        }
+        .log-entry {
+            margin: 3px 0;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 语音对话测试</h1>
+        
+        <div id="status" class="status disconnected">未连接</div>
+        
+        <div class="text-area">
+            <label>你说：</label>
+            <div id="asrText" class="content">等待识别...</div>
+        </div>
+        
+        <div class="text-area" style="max-height: 300px; overflow-y: auto;">
+            <label>AI回复：</label>
+            <div id="llmText" class="content" style="white-space: pre-wrap;">等待回复...</div>
+        </div>
+        
+        <div class="controls">
+            <button id="startBtn" class="btn-start">开始录音</button>
+            <button id="stopBtn" class="btn-stop" disabled>停止录音</button>
+        </div>
+        
+        <div style="text-align: center; margin: 20px 0; padding: 20px; background: #fff3cd; border-radius: 5px;">
+            <h3 style="margin-top: 0;">🎵 测试模式（麦克风损坏时使用）</h3>
+            <input type="file" id="audioFile" accept="audio/*" style="margin: 10px 0;">
+            <button id="simulateBtn" class="btn-start" style="display: block; margin: 10px auto;">上传并模拟发送</button>
+            <p style="font-size: 12px; color: #666;">上传wav/mp3音频文件，系统会模拟实时发送</p>
+        </div>
+        
+        <div class="logs" id="logs"></div>
+    </div>
+
+    <script>
+        const WS_URL = 'ws://127.0.0.1:8001/ws/voice_chat';
+        
+        let socket = null;
+        let audioContext = null;
+        let audioInput = null;
+        let processor = null;
+        let playbackContext = null;
+        let playbackQueue = [];
+        let isPlaying = false;
+        let playbackTime = 0;
+        
+        const statusDiv = document.getElementById('status');
+        const asrDiv = document.getElementById('asrText');
+        const llmDiv = document.getElementById('llmText');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const logsDiv = document.getElementById('logs');
+        const audioFileInput = document.getElementById('audioFile');
+        const simulateBtn = document.getElementById('simulateBtn');
+        
+        function log(msg) {
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logsDiv.appendChild(entry);
+            logsDiv.scrollTop = logsDiv.scrollHeight;
+        }
+        
+        function connectWebSocket() {
+            socket = new WebSocket(WS_URL);
+            socket.binaryType = 'arraybuffer';
+            
+            socket.onopen = () => {
+                statusDiv.textContent = '已连接';
+                statusDiv.className = 'status connected';
+                log('WebSocket已连接');
+            };
+            
+            socket.onmessage = (event) => {
+                if (typeof event.data === 'string') {
+                    if (event.data === 'over') {
+                        log('收到结束信号');
+                        return;
+                    }
+                    try {
+                        const data = JSON.parse(event.data);
+                        handleMessage(data);
+                    } catch (e) {
+                        log('解析消息失败: ' + e.message);
+                    }
+                } else if (event.data instanceof ArrayBuffer) {
+                    log('收到音频数据: ' + event.data.byteLength + ' bytes');
+                    playAudio(event.data);
+                }
+            };
+            
+            socket.onerror = (error) => {
+                log('WebSocket错误');
+                statusDiv.textContent = '连接错误';
+                statusDiv.className = 'status disconnected';
+            };
+            
+            socket.onclose = () => {
+                log('WebSocket已关闭');
+                statusDiv.textContent = '未连接';
+                statusDiv.className = 'status disconnected';
+            };
+        }
+        
+        function handleMessage(data) {
+            switch (data.type) {
+                case 'asr':
+                    asrDiv.textContent = data.data || '识别中...';
+                    log('ASR: ' + data.data);
+                    break;
+                case 'llm':
+                    llmDiv.textContent = data.data || '生成中...';
+                    llmDiv.scrollTop = llmDiv.scrollHeight;
+                    break;
+                case 'tts':
+                    const audioData = base64ToArrayBuffer(data.data);
+                    playAudio(audioData);
+                    break;
+                case 'error':
+                    log('错误: ' + data.data);
+                    alert('错误: ' + data.data);
+                    break;
+            }
+        }
+        
+        function base64ToArrayBuffer(base64) {
+            const binaryString = atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        }
+        
+        function playAudio(arrayBuffer) {
+            if (!playbackContext) {
+                playbackContext = new (window.AudioContext || window.webkitAudioContext)();
+                log('AudioContext创建, 采样率: ' + playbackContext.sampleRate);
+            }
+            
+            const pcmData = new Int16Array(arrayBuffer);
+            
+            if (pcmData.length === 0) {
+                log('⚠️ 收到空音频数据');
+                return;
+            }
+            
+            const wavBuffer = encodeWAV(pcmData, 16000);
+            
+            playbackContext.decodeAudioData(wavBuffer, (audioBuffer) => {
+                playbackQueue.push(audioBuffer);
+                schedulePlayback();
+            }, (error) => {
+                log('⚠️ 音频解码失败: ' + error + ', PCM大小: ' + pcmData.length);
+            });
+        }
+        
+        function schedulePlayback() {
+            if (isPlaying || playbackQueue.length === 0) return;
+            
+            const buffer = playbackQueue.shift();
+            const source = playbackContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(playbackContext.destination);
+            
+            if (playbackTime < playbackContext.currentTime) {
+                playbackTime = playbackContext.currentTime;
+            }
+            
+            source.start(playbackTime);
+            playbackTime += buffer.duration;
+            isPlaying = true;
+            
+            source.onended = () => {
+                isPlaying = false;
+                schedulePlayback();
+            };
+        }
+        
+        function floatTo16BitPCM(float32Array) {
+            const int16Array = new Int16Array(float32Array.length);
+            for (let i = 0; i < float32Array.length; i++) {
+                let s = Math.max(-1, Math.min(1, float32Array[i]));
+                int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return int16Array;
+        }
+        
+        function encodeWAV(samples, sampleRate) {
+            const buffer = new ArrayBuffer(44 + samples.length * 2);
+            const view = new DataView(buffer);
+            
+            const writeString = (offset, string) => {
+                for (let i = 0; i < string.length; i++) {
+                    view.setUint8(offset + i, string.charCodeAt(i));
+                }
+            };
+            
+            writeString(0, 'RIFF');
+            view.setUint32(4, 36 + samples.length * 2, true);
+            writeString(8, 'WAVE');
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, 1, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeString(36, 'data');
+            view.setUint32(40, samples.length * 2, true);
+            
+            let offset = 44;
+            for (let i = 0; i < samples.length; i++, offset += 2) {
+                view.setInt16(offset, samples[i], true);
+            }
+            
+            return buffer;
+        }
+        
+        function startRecording() {
+            connectWebSocket();
+            
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then((stream) => {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    audioInput = audioContext.createMediaStreamSource(stream);
+                    processor = audioContext.createScriptProcessor(4096, 1, 1);
+                    
+                    audioInput.connect(processor);
+                    processor.connect(audioContext.destination);
+                    
+                    processor.onaudioprocess = (e) => {
+                        const audioData = e.inputBuffer.getChannelData(0);
+                        const int16Data = floatTo16BitPCM(audioData);
+                        const wavBuffer = encodeWAV(int16Data, audioContext.sampleRate);
+                        
+                        if (socket && socket.readyState === WebSocket.OPEN) {
+                            socket.send(wavBuffer);
+                        }
+                    };
+                    
+                    log('开始录音');
+                    startBtn.disabled = true;
+                    stopBtn.disabled = false;
+                    asrDiv.textContent = '录音中...';
+                    llmDiv.textContent = '等待回复...';
+                })
+                .catch((err) => {
+                    log('麦克风访问失败: ' + err.message);
+                    alert('无法访问麦克风，请检查权限');
+                });
+        }
+        
+        function stopRecording() {
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+            if (audioInput) {
+                audioInput.disconnect();
+                audioInput = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ type: "end" }));
+                log('发送结束信号');
+            }
+            
+            log('停止录音');
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        }
+        
+        function simulateSendAudio() {
+            const file = audioFileInput.files[0];
+            if (!file) {
+                alert('请先选择音频文件');
+                return;
+            }
+            
+            log('开始模拟发送音频: ' + file.name);
+            asrDiv.textContent = '模拟录音中...';
+            llmDiv.textContent = '等待回复...';
+            
+            connectWebSocket();
+            
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                const arrayBuffer = e.target.result;
+                log('音频文件加载完成，大小: ' + arrayBuffer.byteLength + ' bytes');
+                
+                await new Promise(resolve => {
+                    const checkConnection = setInterval(() => {
+                        if (socket && socket.readyState === WebSocket.OPEN) {
+                            clearInterval(checkConnection);
+                            resolve();
+                        }
+                    }, 100);
+                });
+                
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                
+                log('音频解码成功，时长: ' + audioBuffer.duration.toFixed(2) + '秒');
+                
+                const sampleRate = 16000;
+                const channelData = audioBuffer.getChannelData(0);
+                
+                const resampledData = resampleAudio(channelData, audioBuffer.sampleRate, sampleRate);
+                log('重采样到16000Hz，样本数: ' + resampledData.length);
+                
+                const chunkSize = 4096;
+                const totalChunks = Math.ceil(resampledData.length / chunkSize);
+                const frameInterval = (chunkSize / sampleRate) * 1000;
+                
+                log(`开始发送音频帧，共${totalChunks}帧，间隔${frameInterval.toFixed(1)}ms`);
+                
+                for (let i = 0; i < resampledData.length; i += chunkSize) {
+                    const chunk = resampledData.slice(i, Math.min(i + chunkSize, resampledData.length));
+                    const int16Data = floatTo16BitPCM(chunk);
+                    const pcmBuffer = int16Data.buffer;
+                    
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(pcmBuffer);
+                    }
+                    
+                    const progress = Math.floor((i / resampledData.length) * 100);
+                    asrDiv.textContent = `发送中 ${progress}%`;
+                    
+                    await new Promise(resolve => setTimeout(resolve, frameInterval));
+                }
+                
+                log('音频帧发送完成，发送结束信号');
+                asrDiv.textContent = '识别中...';
+                
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ type: "end" }));
+                }
+            };
+            
+            reader.readAsArrayBuffer(file);
+        }
+        
+        function resampleAudio(sourceData, sourceSampleRate, targetSampleRate) {
+            if (sourceSampleRate === targetSampleRate) {
+                return sourceData;
+            }
+            
+            const ratio = sourceSampleRate / targetSampleRate;
+            const newLength = Math.floor(sourceData.length / ratio);
+            const result = new Float32Array(newLength);
+            
+            for (let i = 0; i < newLength; i++) {
+                const sourceIndex = i * ratio;
+                const index1 = Math.floor(sourceIndex);
+                const index2 = Math.min(index1 + 1, sourceData.length - 1);
+                const fraction = sourceIndex - index1;
+                
+                result[i] = sourceData[index1] * (1 - fraction) + sourceData[index2] * fraction;
+            }
+            
+            return result;
+        }
+        
+        startBtn.addEventListener('click', startRecording);
+        stopBtn.addEventListener('click', stopRecording);
+        simulateBtn.addEventListener('click', simulateSendAudio);
+        
+        log('页面加载完成。真实录音：点击"开始录音"；测试模式：上传音频文件并点击"模拟发送"');
+    </script>
+</body>
+</html>
+
